@@ -90,12 +90,10 @@ static int edu_mmap(struct file *filp, struct vm_area_struct *vma) {
     if (len > EDU_DMA_BUF_SIZE) {
         return -EINVAL;
     }
-    // Only allow offset=0
     if (vma->vm_pgoff) {
         return -EINVAL;
     }
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-    // VM_IO | VM_DONTEXPAND | VM_DONTDUMP are set by remap_pfn_range()
     return vm_iomap_memory(vma, __pa(dev->dma_virt_addr), len);
 }
 
@@ -123,14 +121,12 @@ static int ioctl_factorial(struct edu_device *dev, u32 __user *arg) {
     if (get_user(val, arg)) {
         return -EFAULT;
     }
-    // raise interrupt after finishing factorial computation
     writel(EDU_STATUS_RAISE_IRQ, dev->iomem + EDU_ADDR_STATUS);
     edu_log("Writing %u to register\n", val);
     writel(val, dev->iomem + EDU_ADDR_FACTORIAL);
     if (wait_event_interruptible(dev->irq_wait_queue, !is_computing_factorial(dev))) {
         return -ERESTARTSYS;
     }
-    // read result
     val = readl(dev->iomem + EDU_ADDR_FACTORIAL);
     edu_log("Got factorial result: %u\n", val);
     return put_user(val, arg);
@@ -233,12 +229,9 @@ static irqreturn_t edu_irq_handler(int irq, void *dev_id) {
     struct edu_device *dev = dev_id;
     u32 irq_value;
 
-    // Read the value which raised the interrupt
     irq_value = readl(dev->iomem + EDU_ADDR_IRQ_STATUS);
     edu_log("irq_value = %u\n", irq_value);
-    // Clear the interrupt
     writel(irq_value, dev->iomem + EDU_ADDR_IRQ_ACK);
-    // Wake up any tasks waiting on the queue
     WRITE_ONCE(dev->irq_value, irq_value);
     wake_up_interruptible(&dev->irq_wait_queue);
     return IRQ_HANDLED;
@@ -252,147 +245,4 @@ static void edu_pci_cleanup(struct pci_dev *pdev) {
         cdev_del(&edu_dev->cdev);
         edu_dev->added_cdev = false;
     }
-    if (edu_dev->registered_irq_handler) {
-        free_irq(edu_dev->irq, edu_dev);
-        edu_dev->registered_irq_handler = false;
-    }
-    if (pci_dev_msi_enabled(pdev)) {
-        pci_free_irq_vectors(pdev);
-    }
-}
 
-static int edu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent) {
-    int err;
-    int nvec;
-
-    // enable PCI device
-    err = pcim_enable_device(pdev);
-    if (err) {
-        goto fail;
-    }
-
-    // enable DMA (note that this is necessary for MSI)
-    pci_set_master(pdev);
-    err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(EDU_DMA_BITS));
-    if (err) {
-        goto fail;
-    }
-
-    // set up DMA mapping
-    edu_dev->dma_virt_addr = dmam_alloc_coherent(
-        &pdev->dev, EDU_DMA_BUF_SIZE, &edu_dev->dma_bus_addr, GFP_KERNEL);
-    if (!edu_dev->dma_virt_addr) {
-        err = -ENOMEM;
-        goto fail;
-    }
-    edu_log("DMA bus addr = 0x%08lx\n", (unsigned long)edu_dev->dma_bus_addr);
-    edu_log("DMA virt addr = %p\n", edu_dev->dma_virt_addr);
-
-    // request and iomap PCI BAR
-    // There is one memory region, 1 MB in size
-    edu_log("resource 0: start=0x%08llx end=0x%08llx\n", pci_resource_start(pdev, 0), pci_resource_end(pdev, 0));
-    err = pcim_iomap_regions(pdev, BIT(0), KBUILD_MODNAME);
-    if (err) {
-        goto fail;
-    }
-    edu_dev->iomem = pcim_iomap_table(pdev)[0];
-
-    if (param_msi) {
-        // Fall back to INTx if MSI isn't available
-        nvec = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
-        if (nvec < 0) {
-            err = nvec;
-            goto fail;
-        }
-        edu_dev->irq = pci_irq_vector(pdev, 0);
-    } else {
-        edu_dev->irq = pdev->irq;
-    }
-    edu_log("irq = %u\n", edu_dev->irq);
-    // need IRQF_SHARED because all (legacy) PCI IRQ lines can be shared
-    err = request_irq(edu_dev->irq, edu_irq_handler, IRQF_SHARED, KBUILD_MODNAME, edu_dev);
-    if (err) {
-        goto fail;
-    }
-    edu_dev->registered_irq_handler = true;
-
-    // add char device
-    err = cdev_add(&edu_dev->cdev, devno, 1);
-    if (err) {
-        goto fail;
-    }
-    edu_dev->added_cdev = true;
-
-    return 0;
-fail:
-    edu_pci_cleanup(pdev);
-    return err;
-}
-
-static void edu_pci_remove(struct pci_dev *pdev) {
-    pr_info("removing\n");
-    edu_pci_cleanup(pdev);
-}
-
-static struct pci_driver edu_pci_driver = {
-    .name = KBUILD_MODNAME,
-    .id_table = edu_pci_tbl,
-    .probe = edu_pci_probe,
-    .remove = edu_pci_remove,
-};
-
-static void edu_driver_cleanup(void) {
-    if (edu_dev) {
-        kfree(edu_dev);
-        edu_dev = NULL;
-    }
-    if (devno) {
-        unregister_chrdev_region(devno, 1);
-        devno = 0;
-    }
-}
-
-// Uncomment __init if you don't need to debug this function in gdb
-static int /* __init */ edu_init(void) {
-    int err;
-
-    // allocate device number
-    err = alloc_chrdev_region(&devno, minor, 1, KBUILD_MODNAME);
-    if (err) {
-        return err;
-    }
-    // You can also get the major number by checking /proc/devices
-    pr_alert("device number is %d:%d\n", MAJOR(devno), minor);
-    // Now from userspace you can run e.g.
-    // mknod /dev/edu c 250 0
-
-    // initialize driver state
-    edu_dev = kzalloc(sizeof(*edu_dev), GFP_KERNEL);
-    if (!edu_dev) {
-        err = -ENOMEM;
-        goto fail;
-    }
-    edu_dev_init(edu_dev);
-
-    err = pci_register_driver(&edu_pci_driver);
-    if (err) {
-        goto fail;
-    }
-    return 0;
-
-fail:
-    edu_driver_cleanup();
-    return err;
-}
-
-// Uncomment __exit if you don't need to debug this function in gdb
-static void /* __exit */ edu_exit(void) {
-    pci_unregister_driver(&edu_pci_driver);
-    edu_driver_cleanup();
-}
-
-module_init(edu_init);
-module_exit(edu_exit);
-
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("QEMU EDU device driver");
